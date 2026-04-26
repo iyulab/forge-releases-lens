@@ -348,7 +348,7 @@ jobs:
           gh release edit "${TAG}" \
             --repo ${{ github.repository }} \
             --draft=false \
-            --latest=false
+            --latest=true
 
       - name: Prune old releases in this channel (keep latest 3)
         shell: bash
