@@ -1,0 +1,383 @@
+# iyulab/forge-releases-lens/.github/workflows/build.yml
+#
+# Reusable build & release pipeline for all Forge apps (designated host).
+# The other 5 release repos (forge-releases-{spc,fmea,8d,sop,doe}) call
+# this via `uses:` from their own caller workflow. Per-app GitHub Releases
+# live in whichever repo invoked the workflow (caller_repo = release host).
+#
+# Source code lives in the private iyulab/forge monorepo; this workflow
+# checks out that monorepo and produces signed GitHub Releases.
+#
+# Code signing is delegated to iyulab/code-sign via the dispatch service
+# (sign-request repository_dispatch). NO Azure AD federated credentials are
+# required on this repo — the Key Vault credentials never leave code-sign.
+#
+# Flow:
+#   1. Resolve params (app, version, commit sha from monorepo)
+#   2. Checkout iyulab/forge at the requested sha
+#   3. Build .NET engine + electron-vite + electron-builder (--publish never)
+#   4. Create DRAFT release ({app}-v{version}) with unsigned installer attached
+#   5. repository_dispatch → iyulab/code-sign (sign-request)
+#   6. Poll for the {installer}.signed marker (15s × 60 = 15 min timeout)
+#   7. Download the now-signed installer, recompute SHA512/size, patch
+#      latest-{app}.yml, and upload the fixed metadata
+#   8. Promote draft → published
+#   9. Prune old releases of the same channel (keep latest 3)
+
+name: Build & Release
+
+on:
+  # Direct dispatch from forge/.github/workflows/release.yml (lens app only —
+  # this repo is forge-releases-lens, so its own dispatches build lens).
+  repository_dispatch:
+    types: [build-release]
+  # Manual run for testing / hot-fixes (this repo only — lens).
+  workflow_dispatch:
+    inputs:
+      app:
+        description: App key (kept for reusable callers; lens for this repo direct run)
+        required: true
+        type: choice
+        options:
+          - lens
+          - spc
+          - fmea
+          - 8d
+          - sop
+          - doe
+      version:
+        description: Release version (e.g. 0.7.3)
+        required: true
+        type: string
+      sha:
+        description: iyulab/forge commit sha (default main HEAD)
+        required: false
+        type: string
+  # Reusable invocation from sibling release repos (spc/fmea/8d/sop/doe).
+  workflow_call:
+    inputs:
+      app:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      sha:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  # Serialize builds per-app so concurrent releases of the same channel
+  # cannot race on the draft release or signing marker.
+  group: build-${{ github.event.client_payload.app || inputs.app }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Resolve parameters
+        id: params
+        shell: bash
+        env:
+          APP: ${{ github.event.client_payload.app || inputs.app }}
+          VERSION: ${{ github.event.client_payload.version || inputs.version }}
+          SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APP}" || -z "${VERSION}" ]]; then
+            echo "::error::app and version are required (got app='${APP}' version='${VERSION}')"
+            exit 1
+          fi
+          case "${APP}" in
+            lens|spc|fmea|8d|sop|doe) : ;;
+            *) echo "::error::unknown app '${APP}'"; exit 1 ;;
+          esac
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "::error::version must be semver (got '${VERSION}')"
+            exit 1
+          fi
+          {
+            echo "app=${APP}"
+            echo "version=${VERSION}"
+            echo "sha=${SHA:-main}"
+            echo "tag=${APP}-v${VERSION}"
+            echo "installer=forge-${APP}-${VERSION}-setup.exe"
+            echo "latest_yml=latest-${APP}.yml"
+            echo "app_dir=apps/forge-${APP}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout forge monorepo
+        uses: actions/checkout@v4
+        with:
+          repository: iyulab/forge
+          ref: ${{ steps.params.outputs.sha }}
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Sync package version
+        shell: bash
+        env:
+          APP_DIR: ${{ steps.params.outputs.app_dir }}
+          VERSION: ${{ steps.params.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e "
+            const fs = require('fs');
+            const path = process.env.APP_DIR + '/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: ${{ runner.os }}-npm-
+
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: ${{ runner.os }}-nuget-
+
+      - name: Install monorepo dependencies
+        run: npm install
+
+      # forge-lens bundles VC++ redistributable for runtime dependencies of the
+      # ONNX runtime used in detection/transcription. Other apps skip this.
+      - name: Download VC++ Redistributable (lens only)
+        if: steps.params.outputs.app == 'lens'
+        shell: bash
+        run: |
+          curl -sSL -o apps/forge-lens/build/vc_redist.x64.exe \
+            "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+
+      - name: Build .NET engine
+        working-directory: ${{ steps.params.outputs.app_dir }}
+        run: npm run build:engine
+
+      - name: Resolve electron version
+        id: electron
+        working-directory: ${{ steps.params.outputs.app_dir }}
+        shell: bash
+        run: |
+          VER=$(node -e "console.log(require('./package.json').devDependencies.electron.replace('^',''))")
+          echo "version=${VER}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build electron app (no publish)
+        working-directory: ${{ steps.params.outputs.app_dir }}
+        shell: bash
+        env:
+          ELECTRON_VER: ${{ steps.electron.outputs.version }}
+        run: |
+          set -euo pipefail
+          npx electron-vite build
+          npx electron-builder --win \
+            --config electron-builder.config.ts \
+            -c.electronVersion=${ELECTRON_VER} \
+            --publish never
+
+      - name: Create draft release and upload unsigned installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ steps.params.outputs.tag }}
+          APP: ${{ steps.params.outputs.app }}
+          VERSION: ${{ steps.params.outputs.version }}
+          APP_DIR: ${{ steps.params.outputs.app_dir }}
+          INSTALLER: ${{ steps.params.outputs.installer }}
+        run: |
+          set -euo pipefail
+          cd "${APP_DIR}/dist"
+
+          if [[ ! -f "${INSTALLER}" ]]; then
+            echo "::error::expected installer '${INSTALLER}' not found in dist/"
+            ls -la
+            exit 1
+          fi
+
+          # Delete pre-existing draft with the same tag (idempotent retry).
+          if gh release view "${TAG}" --repo ${{ github.repository }} >/dev/null 2>&1; then
+            echo "Existing release '${TAG}' found — deleting for fresh draft"
+            gh release delete "${TAG}" --repo ${{ github.repository }} --yes --cleanup-tag
+          fi
+
+          APP_TITLE="$(echo "${APP}" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+          # Only the installer is uploaded at this stage. The channel-suffixed
+          # latest-{app}.yml metadata is generated AFTER signing in a later
+          # step, since electron-builder with --publish never does not write
+          # any latest.yml file (the metadata is normally created by the
+          # publisher, which we deliberately skip here).
+          gh release create "${TAG}" \
+            --repo ${{ github.repository }} \
+            --draft \
+            --title "Forge-${APP_TITLE} v${VERSION}" \
+            --notes "Forge-${APP_TITLE} ${VERSION}" \
+            "${INSTALLER}"
+
+      - name: Dispatch sign-request to iyulab/code-sign
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ steps.params.outputs.tag }}
+          INSTALLER: ${{ steps.params.outputs.installer }}
+          REQUEST_ID: forge-releases-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          PAYLOAD=$(jq -n \
+            --arg caller_repo "${{ github.repository }}" \
+            --arg release_tag "${TAG}" \
+            --arg asset "${INSTALLER}" \
+            --arg request_id "${REQUEST_ID}" \
+            '{
+              event_type: "sign-request",
+              client_payload: {
+                caller_repo: $caller_repo,
+                release_tag: $release_tag,
+                assets: [$asset],
+                request_id: $request_id
+              }
+            }')
+          echo "${PAYLOAD}"
+          echo "${PAYLOAD}" | gh api repos/iyulab/code-sign/dispatches \
+            --method POST --input -
+
+      - name: Wait for signed marker
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ steps.params.outputs.tag }}
+          INSTALLER: ${{ steps.params.outputs.installer }}
+        run: |
+          set -euo pipefail
+          MARKER="${INSTALLER}.signed"
+          for i in $(seq 1 60); do
+            if gh release view "${TAG}" \
+                 --repo ${{ github.repository }} \
+                 --json assets \
+               | jq -e --arg m "${MARKER}" \
+                   '.assets[]? | select(.name == $m)' > /dev/null; then
+              echo "Signed marker '${MARKER}' detected after ${i} poll(s)"
+              exit 0
+            fi
+            echo "[${i}/60] waiting for '${MARKER}'..."
+            sleep 15
+          done
+          echo "::error::Timeout waiting for signing marker '${MARKER}'. Check iyulab/code-sign workflow runs."
+          exit 1
+
+      - name: Generate latest-${{ steps.params.outputs.app }}.yml from signed installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ steps.params.outputs.tag }}
+          VERSION: ${{ steps.params.outputs.version }}
+          INSTALLER: ${{ steps.params.outputs.installer }}
+          LATEST_YML: ${{ steps.params.outputs.latest_yml }}
+        run: |
+          set -euo pipefail
+          mkdir -p signed-work
+          cd signed-work
+
+          # Download the now-signed installer.
+          gh release download "${TAG}" \
+            --repo ${{ github.repository }} \
+            --pattern "${INSTALLER}"
+
+          SIZE=$(stat -c%s "${INSTALLER}")
+          # electron-updater expects SHA512 as base64 (not hex).
+          SHA512_B64=$(openssl dgst -sha512 -binary "${INSTALLER}" | base64 -w 0)
+          RELEASE_DATE=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+
+          echo "Signed installer: ${INSTALLER}"
+          echo "  size:        ${SIZE}"
+          echo "  sha512(b64): ${SHA512_B64}"
+          echo "  releaseDate: ${RELEASE_DATE}"
+
+          # Generate latest-{app}.yml from scratch in the electron-updater
+          # format. The metadata is normally produced by electron-builder's
+          # publisher, but we run with --publish never so that signing can
+          # happen between the build and metadata generation; otherwise the
+          # SHA512 in latest.yml would refer to the unsigned installer and
+          # the signed installer would fail update verification.
+          cat > "${LATEST_YML}" <<EOF
+          version: ${VERSION}
+          files:
+            - url: ${INSTALLER}
+              sha512: ${SHA512_B64}
+              size: ${SIZE}
+          path: ${INSTALLER}
+          sha512: ${SHA512_B64}
+          releaseDate: '${RELEASE_DATE}'
+          EOF
+
+          echo "--- ${LATEST_YML} ---"
+          cat "${LATEST_YML}"
+
+          # Upload the metadata file alongside the signed installer.
+          gh release upload "${TAG}" \
+            --repo ${{ github.repository }} \
+            --clobber \
+            "${LATEST_YML}"
+
+      - name: Promote draft to published
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ steps.params.outputs.tag }}
+        run: |
+          gh release edit "${TAG}" \
+            --repo ${{ github.repository }} \
+            --draft=false \
+            --latest=false
+
+      - name: Prune old releases in this channel (keep latest 3)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          APP: ${{ steps.params.outputs.app }}
+        run: |
+          set -euo pipefail
+          # List published (non-draft) releases matching the app prefix, keep
+          # the 3 most recently published, delete the rest (with their tags).
+          # publishedAt is used instead of createdAt to reflect actual release
+          # graduation time — draft creation time could misorder a just-signed
+          # release below an older, earlier-drafted one.
+          gh release list \
+            --repo ${{ github.repository }} \
+            --limit 100 \
+            --json tagName,isDraft,publishedAt \
+            | jq -r --arg prefix "${APP}-v" '
+                [ .[] | select(.isDraft == false)
+                       | select(.tagName | startswith($prefix)) ]
+                | sort_by(.publishedAt) | reverse | .[3:] | .[].tagName
+              ' \
+            | while IFS= read -r old_tag; do
+                # Strip trailing CR so Windows runner bash (Git Bash)
+                # doesn't append \r to the tag name and break gh's URL.
+                old_tag="${old_tag%$'\r'}"
+                [[ -z "${old_tag}" ]] && continue
+                echo "Deleting old release: ${old_tag}"
+                gh release delete "${old_tag}" \
+                  --repo ${{ github.repository }} \
+                  --yes --cleanup-tag
+              done
