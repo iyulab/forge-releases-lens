@@ -109,7 +109,12 @@ jobs:
             echo "sha=${SHA:-main}"
             echo "tag=${APP}-v${VERSION}"
             echo "installer=forge-${APP}-${VERSION}-setup.exe"
-            echo "latest_yml=latest-${APP}.yml"
+            # electron-updater default channel is `latest` → standard yml name.
+            # legacy_yml is kept for backwards-compatibility with any older
+            # client that still references the channel-suffixed name from the
+            # pre-repo-split design (see iyulab/forge build-config builder.ts).
+            echo "latest_yml=latest.yml"
+            echo "legacy_yml=latest-${APP}.yml"
             echo "app_dir=apps/forge-${APP}"
           } >> "${GITHUB_OUTPUT}"
 
@@ -286,7 +291,7 @@ jobs:
           echo "::error::Timeout waiting for signing marker '${MARKER}'. Check iyulab/code-sign workflow runs."
           exit 1
 
-      - name: Generate latest-${{ steps.params.outputs.app }}.yml from signed installer
+      - name: Generate latest.yml from signed installer
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
@@ -294,6 +299,7 @@ jobs:
           VERSION: ${{ steps.params.outputs.version }}
           INSTALLER: ${{ steps.params.outputs.installer }}
           LATEST_YML: ${{ steps.params.outputs.latest_yml }}
+          LEGACY_YML: ${{ steps.params.outputs.legacy_yml }}
         run: |
           set -euo pipefail
           mkdir -p signed-work
@@ -334,11 +340,17 @@ jobs:
           echo "--- ${LATEST_YML} ---"
           cat "${LATEST_YML}"
 
-          # Upload the metadata file alongside the signed installer.
+          # Mirror to the legacy channel-suffixed name so older installs that
+          # were shipped before the repo-split unification can still resolve
+          # their update metadata. Safe to drop once telemetry confirms zero
+          # legacy clients remain in the field.
+          cp "${LATEST_YML}" "${LEGACY_YML}"
+
+          # Upload both metadata files alongside the signed installer.
           gh release upload "${TAG}" \
             --repo ${{ github.repository }} \
             --clobber \
-            "${LATEST_YML}"
+            "${LATEST_YML}" "${LEGACY_YML}"
 
       - name: Promote draft to published
         shell: bash
