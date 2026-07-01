@@ -124,6 +124,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: iyulab/forge
+          submodules: recursive
           ref: ${{ steps.params.outputs.sha }}
           token: ${{ secrets.RELEASE_TOKEN }}
 
