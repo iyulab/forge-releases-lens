@@ -45,6 +45,7 @@ on:
           - 8d
           - sop
           - doe
+          - plan
       version:
         description: Release version (e.g. 0.7.3)
         required: true
@@ -96,7 +97,7 @@ jobs:
             exit 1
           fi
           case "${APP}" in
-            lens|spc|fmea|8d|sop|doe) : ;;
+            lens|spc|fmea|8d|sop|doe|plan) : ;;
             *) echo "::error::unknown app '${APP}'"; exit 1 ;;
           esac
           if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
@@ -182,6 +183,17 @@ jobs:
       - name: Build .NET engine
         working-directory: ${{ steps.params.outputs.app_dir }}
         run: npm run build:engine
+
+      # forge-plan is the only dual-engine app: alongside the .NET engine it
+      # bundles a Rust FCS solver (engine-rs → engine-bin/plan-engine.exe via
+      # copy-engine-rs.mjs). windows-latest ships Rust stable, and the shared
+      # forge-guard beforePack already exercises cargo, so no toolchain setup
+      # is needed here. Guarded on app==plan → the 6 .NET-only apps are byte-
+      # identical to before.
+      - name: Build Rust engine (plan only)
+        if: steps.params.outputs.app == 'plan'
+        working-directory: ${{ steps.params.outputs.app_dir }}
+        run: npm run build:engine-rs
 
       - name: Resolve electron version
         id: electron
