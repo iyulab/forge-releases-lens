@@ -171,6 +171,41 @@ jobs:
       - name: Install monorepo dependencies
         run: npm install
 
+      # TEMPORARY DIAGNOSTIC — remove once the cause is established.
+      #
+      # 2026-08-04: forge-lens packaging began aborting because the bundled media
+      # binaries (ffmpeg-static/ffprobe-static) are absent after install, while the
+      # same install step reports success ("added 1248 packages ... in 1m"). The two
+      # packages obtain their binaries differently — one downloads in an install
+      # script, the other ships them inside the tarball (~350MB) with no script —
+      # so a single download failure does not explain both being empty. The last
+      # good build's log has expired, so there is nothing to diff against.
+      #
+      # This step only observes. `continue-on-error` plus `|| true` on every command
+      # keep it incapable of failing a release for any of the apps that reuse this
+      # workflow.
+      - name: Diagnose media dependency install state (temporary)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "===== disk ====="
+          df -h . || true
+          echo "===== npm ls ====="
+          npm ls ffmpeg-static ffprobe-static --depth=0 || true
+          echo "===== ffmpeg-static ====="
+          ls -la node_modules/ffmpeg-static/ 2>/dev/null || echo "DIRECTORY ABSENT"
+          echo "===== ffprobe-static ====="
+          ls -la node_modules/ffprobe-static/ 2>/dev/null || echo "DIRECTORY ABSENT"
+          echo "===== ffprobe-static/bin (recursive) ====="
+          ls -laR node_modules/ffprobe-static/bin/ 2>/dev/null | head -40 || echo "ABSENT"
+          echo "===== better-sqlite3 prebuild (root postinstall reported 'No native modules found') ====="
+          ls -la node_modules/better-sqlite3/build/Release/ 2>/dev/null || echo "ABSENT"
+          echo "===== top-level package count ====="
+          ls node_modules 2>/dev/null | wc -l || true
+          echo "===== npm cache ====="
+          npm cache verify 2>&1 | head -10 || true
+
       # forge-lens bundles VC++ redistributable for runtime dependencies of the
       # ONNX runtime used in detection/transcription. Other apps skip this.
       - name: Download VC++ Redistributable (lens only)
