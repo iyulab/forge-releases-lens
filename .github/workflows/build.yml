@@ -245,7 +245,22 @@ jobs:
           ELECTRON_VER: ${{ steps.electron.outputs.version }}
         run: |
           set -euo pipefail
+
+          # TEMPORARY DIAGNOSTIC (2026-08-04) — bisect between the two commands.
+          # The bundled media binaries are present right after install but absent
+          # by the time packaging validates them, so this brackets which command
+          # removes them. Purely observational; remove with the probe step above.
+          probe() {
+            echo "===== media binaries: $1 ====="
+            ls -la ../../node_modules/ffmpeg-static/ffmpeg.exe 2>/dev/null || echo "  ffmpeg.exe ABSENT"
+            ls -la ../../node_modules/ffprobe-static/bin/win32/x64/ffprobe.exe 2>/dev/null || echo "  ffprobe.exe ABSENT"
+            ls ../../node_modules 2>/dev/null | wc -l | sed 's/^/  top-level packages: /' || true
+          }
+
+          probe "before electron-vite build"
           npx electron-vite build
+          probe "after electron-vite build / before electron-builder"
+
           npx electron-builder --win \
             --config electron-builder.config.ts \
             -c.electronVersion=${ELECTRON_VER} \
