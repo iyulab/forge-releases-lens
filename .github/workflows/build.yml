@@ -316,6 +316,7 @@ jobs:
           LATEST_YML: ${{ steps.params.outputs.latest_yml }}
           LEGACY_YML: ${{ steps.params.outputs.legacy_yml }}
           APP_YML: ${{ steps.params.outputs.app_yml }}
+          APP_DIR: ${{ steps.params.outputs.app_dir }}
         run: |
           set -euo pipefail
           mkdir -p signed-work
@@ -364,11 +365,35 @@ jobs:
           # Bare {app}.yml alias for older clients that used channel={app} config (ISS-013).
           cp "${LATEST_YML}" "${APP_YML}"
 
-          # Upload both metadata files alongside the signed installer.
+          # Regenerate the blockmap FROM THE SIGNED installer. electron-builder
+          # wrote one next to the unsigned installer at build time, but signing
+          # changes the bytes, so that blockmap's chunk hashes would not match
+          # what clients download — the same reason latest.yml's sha512 is
+          # recomputed here rather than taken from the build. electron-updater
+          # fetches it by URL convention (<installer-url>.blockmap); without it
+          # every update falls back to a full ~210 MB download.
+          # electron-builder 26 builds blockmaps in JS (app-builder-lib, no
+          # app-builder-bin any more); call the same function it uses, resolved
+          # from the app's dependency tree — the node_modules `npm install`
+          # populated above.
+          SIGNED_INSTALLER="$(pwd)/${INSTALLER}"
+          (
+            cd "${GITHUB_WORKSPACE}/${APP_DIR}"
+            node -e "
+              const { buildBlockMap } = require('app-builder-lib/out/targets/blockmap/blockmap')
+              const [file] = process.argv.slice(1)
+              buildBlockMap(file, 'gzip', file + '.blockmap')
+                .then((info) => console.log('  blockmap:    ' + JSON.stringify(info)))
+                .catch((err) => { console.error(err); process.exit(1) })
+            " "${SIGNED_INSTALLER}"
+          )
+          test -s "${INSTALLER}.blockmap"
+
+          # Upload the metadata files and the blockmap alongside the signed installer.
           gh release upload "${TAG}" \
             --repo ${{ github.repository }} \
             --clobber \
-            "${LATEST_YML}" "${LEGACY_YML}" "${APP_YML}"
+            "${INSTALLER}.blockmap" "${LATEST_YML}" "${LEGACY_YML}" "${APP_YML}"
 
       - name: Promote draft to published
         shell: bash
